@@ -9,8 +9,8 @@
     "redis": "^5.11.0",
     "ws": "^8.19.0"
   },
-  "name": "medical-tourism-agent",
-  "version": "1.0.0",
+  "name": "Vanos",
+  "version": "1.0.1",
   "description": "",
   "main": "index.js",
   "scripts": {
