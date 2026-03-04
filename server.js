@@ -3,7 +3,7 @@ const { createClient, AgentEvents } = require("@deepgram/sdk");
 const { WebSocketServer } = require("ws");
 const http = require("http");
 const { createClient: createRedisClient } = require("redis");
-const nodemailer = require("nodemailer");
+const { Resend } = require("resend");
 
 const PORT = process.env.PORT || 3001;
 const MAX_CONNECTIONS_PER_IP = 3;
@@ -13,6 +13,7 @@ const DEMO_DURATION_MS = 10 * 60 * 1000;
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
 
 const deepgram = createClient(process.env.DEEPGRAM_API_KEY);
+const resend = new Resend(process.env.RESEND_API_KEY);
 const connectionCounts = new Map();
 const requestTimestamps = new Map();
 
@@ -20,19 +21,6 @@ const requestTimestamps = new Map();
 const redis = createRedisClient({ url: process.env.REDIS_URL });
 redis.on("error", (err) => console.error("Redis error:", err));
 redis.connect().then(() => console.log("Redis connected"));
-
-// ── Nodemailer (Gmail) ────────────────────────────────────────────────────────
-const transporter = nodemailer.createTransport({
-  host: "smtp.gmail.com",
-  port: 465,
-  secure: true,
-  auth: {
-    user: process.env.GMAIL_USER,
-    pass: process.env.GMAIL_APP_PASSWORD,
-  },
-  connectionTimeout: 10000,
-  greetingTimeout: 10000,
-});
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function parseBody(req) {
@@ -65,6 +53,103 @@ function generateOTP() {
   return Math.floor(100000 + Math.random() * 900000).toString();
 }
 
+// ── Email template ────────────────────────────────────────────────────────────
+function otpEmailHtml(firstName, otp) {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Your VANOS Access Code</title>
+</head>
+<body style="margin:0;padding:0;background:#000000;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#000000;padding:48px 0;">
+    <tr>
+      <td align="center">
+        <table width="520" cellpadding="0" cellspacing="0" style="max-width:520px;width:100%;">
+
+          <!-- Header -->
+          <tr>
+            <td style="padding:0 0 40px 0;">
+              <table cellpadding="0" cellspacing="0">
+                <tr>
+                  <td>
+                    <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#f97316;margin-right:10px;vertical-align:middle;"></span>
+                  </td>
+                  <td>
+                    <span style="font-size:11px;letter-spacing:0.3em;color:rgba(255,255,255,0.35);text-transform:uppercase;font-weight:500;vertical-align:middle;">VANOS AI</span>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+
+          <!-- Card -->
+          <tr>
+            <td style="background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);border-radius:20px;padding:48px 44px;">
+
+              <!-- Greeting -->
+              <p style="margin:0 0 8px;font-size:13px;color:rgba(255,255,255,0.4);letter-spacing:0.02em;">
+                Hi ${firstName},
+              </p>
+              <h1 style="margin:0 0 16px;font-size:28px;font-weight:700;color:#ffffff;letter-spacing:-0.02em;line-height:1.2;">
+                Your access code
+              </h1>
+              <p style="margin:0 0 36px;font-size:14px;color:rgba(255,255,255,0.45);line-height:1.7;">
+                Use the code below to verify your email and access your 10&#8209;minute VANOS demo session. Your time is saved — you can return anytime to use what's left.
+              </p>
+
+              <!-- OTP block -->
+              <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:36px;">
+                <tr>
+                  <td style="background:rgba(249,115,22,0.07);border:1px solid rgba(249,115,22,0.2);border-radius:14px;padding:28px 24px;text-align:center;">
+                    <p style="margin:0 0 8px;font-size:11px;letter-spacing:0.25em;color:rgba(249,115,22,0.6);text-transform:uppercase;">Verification Code</p>
+                    <p style="margin:0;font-size:44px;font-weight:700;letter-spacing:0.35em;color:#f97316;line-height:1;">${otp}</p>
+                  </td>
+                </tr>
+              </table>
+
+              <!-- Divider -->
+              <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:28px;">
+                <tr>
+                  <td style="border-top:1px solid rgba(255,255,255,0.06);font-size:0;">&nbsp;</td>
+                </tr>
+              </table>
+
+              <!-- What is VANOS -->
+              <p style="margin:0 0 10px;font-size:12px;font-weight:600;color:rgba(255,255,255,0.5);letter-spacing:0.1em;text-transform:uppercase;">What you're accessing</p>
+              <p style="margin:0 0 28px;font-size:13px;color:rgba(255,255,255,0.35);line-height:1.7;">
+                VANOS is the operating system for voice agents — real&#8209;time voice&#8209;to&#8209;voice infrastructure, enterprise workflow orchestration, and multi&#8209;agent coordination built for scale.
+              </p>
+
+              <!-- Expiry note -->
+              <p style="margin:0;font-size:12px;color:rgba(255,255,255,0.2);line-height:1.6;">
+                This code expires in <span style="color:rgba(255,255,255,0.4);">10 minutes</span>. If you didn't request this, you can safely ignore this email.
+              </p>
+
+            </td>
+          </tr>
+
+          <!-- Footer -->
+          <tr>
+            <td style="padding:28px 0 0 0;text-align:center;">
+              <p style="margin:0 0 6px;font-size:11px;color:rgba(255,255,255,0.15);letter-spacing:0.05em;">
+                VANOS AI · SPACEDOME · San Francisco
+              </p>
+              <p style="margin:0;font-size:11px;color:rgba(255,255,255,0.1);">
+                You're receiving this because you requested demo access at vanos.ai
+              </p>
+            </td>
+          </tr>
+
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>`;
+}
+
 // ── Google token verification ─────────────────────────────────────────────────
 async function verifyGoogleToken(idToken) {
   try {
@@ -79,13 +164,12 @@ async function verifyGoogleToken(idToken) {
   }
 }
 
-// ── Session helpers ───────────────────────────────────────────────────────────
+// ── Session helper ────────────────────────────────────────────────────────────
 async function createOrGetSession(email, firstName, lastName) {
   const redisKey = `demo:${email}`;
   const existing = await redis.hGetAll(redisKey);
-
-  let remainingMs;
   const sessionToken = generateSessionToken();
+  let remainingMs;
 
   if (existing && existing.remainingMs !== undefined) {
     remainingMs = parseInt(existing.remainingMs, 10);
@@ -117,46 +201,29 @@ async function handleSendOtp(req, res) {
   if (!email || !email.includes("@")) return sendJSON(res, 400, { error: "Valid email required" });
   if (!firstName) return sendJSON(res, 400, { error: "First name required" });
 
-  // Rate limit OTP sends — max 3 per email per 10 minutes
+  // Rate limit — max 3 sends per email per 10 minutes
   const rateLimitKey = `otp_rate:${email}`;
   const sendCount = await redis.incr(rateLimitKey);
-  if (sendCount === 1) await redis.expire(rateLimitKey, 600); // 10 min window
-  if (sendCount > 3) {
-    return sendJSON(res, 429, { error: "Too many attempts. Please wait 10 minutes." });
-  }
+  if (sendCount === 1) await redis.expire(rateLimitKey, 600);
+  if (sendCount > 3) return sendJSON(res, 429, { error: "Too many attempts. Please wait 10 minutes." });
 
   const otp = generateOTP();
-  const otpKey = `otp:${email}`;
+  await redis.hSet(`otp:${email}`, { otp, firstName, lastName, email });
+  await redis.expire(`otp:${email}`, 600);
 
-  // Store OTP with 10 minute expiry alongside user details
-  await redis.hSet(otpKey, { otp, firstName, lastName, email });
-  await redis.expire(otpKey, 600);
-
-  // Send email
   try {
-    await transporter.sendMail({
-      from: `"VANOS AI" <${process.env.GMAIL_USER}>`,
+    const { error } = await resend.emails.send({
+      from: "VANOS AI <onboarding@resend.dev>",
       to: email,
-      subject: "Your VANOS Demo Access Code",
-      html: `
-        <div style="font-family: -apple-system, sans-serif; max-width: 480px; margin: 0 auto; padding: 40px 24px; background: #000; color: #fff;">
-          <div style="margin-bottom: 32px;">
-            <span style="display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #f97316; margin-right: 8px;"></span>
-            <span style="font-size: 12px; letter-spacing: 0.3em; color: rgba(255,255,255,0.4); text-transform: uppercase;">VANOS AI</span>
-          </div>
-          <h1 style="font-size: 28px; font-weight: 700; margin: 0 0 12px; color: #fff;">Your access code</h1>
-          <p style="color: rgba(255,255,255,0.5); font-size: 15px; line-height: 1.6; margin: 0 0 32px;">
-            Hi ${firstName}, use the code below to access your 10-minute VANOS demo.
-          </p>
-          <div style="background: rgba(249,115,22,0.08); border: 1px solid rgba(249,115,22,0.25); border-radius: 12px; padding: 24px; text-align: center; margin-bottom: 32px;">
-            <span style="font-size: 42px; font-weight: 700; letter-spacing: 0.3em; color: #f97316;">${otp}</span>
-          </div>
-          <p style="color: rgba(255,255,255,0.3); font-size: 13px; margin: 0;">
-            This code expires in 10 minutes. If you didn't request this, ignore this email.
-          </p>
-        </div>
-      `,
+      subject: `${otp} is your VANOS access code`,
+      html: otpEmailHtml(firstName, otp),
     });
+
+    if (error) {
+      console.error("Resend error:", error);
+      return sendJSON(res, 500, { error: "Failed to send email. Please try again." });
+    }
+
     console.log(`[OTP] Sent to ${email}`);
     return sendJSON(res, 200, { success: true });
   } catch (err) {
@@ -173,32 +240,19 @@ async function handleVerifyOtp(req, res) {
 
   if (!email || !otp) return sendJSON(res, 400, { error: "Email and OTP required" });
 
-  const otpKey = `otp:${email}`;
-  const stored = await redis.hGetAll(otpKey);
+  const stored = await redis.hGetAll(`otp:${email}`);
+  if (!stored || !stored.otp) return sendJSON(res, 400, { error: "Code expired. Please request a new one." });
+  if (stored.otp !== otp)     return sendJSON(res, 401, { error: "Incorrect code. Please try again." });
 
-  if (!stored || !stored.otp) {
-    return sendJSON(res, 400, { error: "Code expired. Please request a new one." });
-  }
-
-  if (stored.otp !== otp) {
-    return sendJSON(res, 401, { error: "Incorrect code. Please try again." });
-  }
-
-  // OTP valid — delete it so it can't be reused
-  await redis.del(otpKey);
-
-  // Create or retrieve session
+  await redis.del(`otp:${email}`);
   const session = await createOrGetSession(email, stored.firstName, stored.lastName);
   return sendJSON(res, 200, session);
 }
 
-// POST /session/start (Google OAuth path only)
+// POST /session/start — Google OAuth only
 async function handleSessionStart(req, res) {
   const body = await parseBody(req);
-
-  if (!body.googleToken) {
-    return sendJSON(res, 400, { error: "Use /session/send-otp for email sign-in" });
-  }
+  if (!body.googleToken) return sendJSON(res, 400, { error: "Use /session/send-otp for email sign-in" });
 
   const googleUser = await verifyGoogleToken(body.googleToken);
   if (!googleUser) return sendJSON(res, 401, { error: "Invalid Google token" });
@@ -212,21 +266,16 @@ async function handleSessionSync(req, res) {
   const body = await parseBody(req);
   const { sessionToken, elapsedMs } = body;
 
-  if (!sessionToken || typeof elapsedMs !== "number") {
-    return sendJSON(res, 400, { error: "sessionToken and elapsedMs required" });
-  }
+  if (!sessionToken || typeof elapsedMs !== "number") return sendJSON(res, 400, { error: "sessionToken and elapsedMs required" });
 
   const email = await redis.get(`token:${sessionToken}`);
   if (!email) return sendJSON(res, 401, { error: "Invalid or expired session" });
 
-  const redisKey = `demo:${email}`;
-  const existing = await redis.hGetAll(redisKey);
+  const existing = await redis.hGetAll(`demo:${email}`);
   if (!existing) return sendJSON(res, 404, { error: "Session not found" });
 
-  const currentRemaining = parseInt(existing.remainingMs, 10);
-  const newRemaining = Math.max(0, currentRemaining - Math.round(elapsedMs));
-  await redis.hSet(redisKey, "remainingMs", newRemaining.toString());
-
+  const newRemaining = Math.max(0, parseInt(existing.remainingMs, 10) - Math.round(elapsedMs));
+  await redis.hSet(`demo:${email}`, "remainingMs", newRemaining.toString());
   return sendJSON(res, 200, { remainingMs: newRemaining });
 }
 
@@ -234,7 +283,6 @@ async function handleSessionSync(req, res) {
 async function handleSessionStatus(req, res) {
   const url = new URL(req.url, `http://localhost`);
   const sessionToken = url.searchParams.get("token");
-
   if (!sessionToken) return sendJSON(res, 400, { error: "token required" });
 
   const email = await redis.get(`token:${sessionToken}`);
@@ -268,24 +316,23 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  if (req.method === "POST" && req.url === "/session/send-otp")   return handleSendOtp(req, res);
-  if (req.method === "POST" && req.url === "/session/verify-otp") return handleVerifyOtp(req, res);
-  if (req.method === "POST" && req.url === "/session/start")      return handleSessionStart(req, res);
-  if (req.method === "POST" && req.url === "/session/sync")       return handleSessionSync(req, res);
+  if (req.method === "POST" && req.url === "/session/send-otp")        return handleSendOtp(req, res);
+  if (req.method === "POST" && req.url === "/session/verify-otp")      return handleVerifyOtp(req, res);
+  if (req.method === "POST" && req.url === "/session/start")           return handleSessionStart(req, res);
+  if (req.method === "POST" && req.url === "/session/sync")            return handleSessionSync(req, res);
   if (req.method === "GET"  && req.url?.startsWith("/session/status")) return handleSessionStatus(req, res);
 
-  // Static files
   const fs   = require("fs");
   const path = require("path");
   let filePath = req.url === "/" || req.url === "/index.html"
     ? "./dist/index.html"
     : path.join("./dist", req.url);
 
-  const ext = path.extname(filePath);
   const mimeTypes = {
     ".js": "application/javascript", ".css": "text/css", ".html": "text/html",
     ".png": "image/png", ".jpg": "image/jpeg", ".svg": "image/svg+xml",
     ".json": "application/json", ".woff": "font/woff", ".woff2": "font/woff2",
+    ".otf": "font/otf", ".ttf": "font/ttf",
   };
 
   fs.readFile(filePath, (err, data) => {
@@ -297,6 +344,7 @@ const server = http.createServer(async (req, res) => {
       });
       return;
     }
+    const ext = path.extname(filePath);
     res.writeHead(200, { "Content-Type": mimeTypes[ext] || "text/html" });
     res.end(data);
   });
@@ -541,8 +589,7 @@ Do not use [DIAL_OPERATOR] unless explicitly instructed.`
         if (data?.role === "assistant" && data?.content) {
           const content = data.content.toLowerCase();
           const farewellPhrases = ["have a great day","goodbye","take care","talk to you soon","feel free to reach out","have a wonderful day","all the best"];
-          const matched = farewellPhrases.find(p => content.includes(p));
-          if (matched) { pendingFarewell = true; callEnding = true; }
+          if (farewellPhrases.find(p => content.includes(p))) { pendingFarewell = true; callEnding = true; }
         }
       });
 
@@ -598,7 +645,7 @@ Do not use [DIAL_OPERATOR] unless explicitly instructed.`
       const chunk = Buffer.isBuffer(msg) ? msg : Buffer.from(msg);
       if (chunk.length > 96000) return;
       if (agentReady && deepgramConnection) {
-        try { deepgramConnection.send(chunk); } catch (err) { console.error(`[${clientIP}] Audio send failed:`, err.message); }
+        try { deepgramConnection.send(chunk); } catch (err) { console.error(`Audio send failed:`, err.message); }
       } else {
         pendingAudio.push(chunk);
         if (pendingAudio.length > 100) pendingAudio.shift();
