@@ -1,0 +1,436 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Vanos Voice Agent</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: system-ui, sans-serif;
+      background: #0f0f10;
+      color: #e8e8e8;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      gap: 24px;
+      padding: 24px;
+    }
+
+    h1 { font-size: 1.4rem; font-weight: 600; letter-spacing: -0.02em; }
+
+    #status {
+      font-size: 0.85rem;
+      color: #888;
+      min-height: 1.2em;
+      text-align: center;
+    }
+    #status.error   { color: #ff6b6b; }
+    #status.warning { color: #ffd93d; }
+    #status.success { color: #6bcf7f; }
+
+    #btn {
+      width: 80px;
+      height: 80px;
+      border-radius: 50%;
+      border: none;
+      background: #1e1e22;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: background 0.2s, box-shadow 0.2s;
+      outline: none;
+    }
+    #btn:hover:not(:disabled) { background: #2a2a30; }
+    #btn:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+    #btn.listening {
+      background: #c0392b;
+      box-shadow: 0 0 0 8px rgba(192, 57, 43, 0.25);
+      animation: pulse 1.5s infinite;
+    }
+    #btn.speaking { background: #1a6b3c; }
+    #btn.reconnecting {
+      background: #e67e22;
+      animation: pulse 1s infinite;
+    }
+
+    @keyframes pulse {
+      0%, 100% { box-shadow: 0 0 0 8px rgba(192, 57, 43, 0.2); }
+      50%       { box-shadow: 0 0 0 16px rgba(192, 57, 43, 0.05); }
+    }
+
+    svg { width: 32px; height: 32px; fill: #e8e8e8; }
+
+    #transcript {
+      width: 100%;
+      max-width: 520px;
+      max-height: 280px;
+      overflow-y: auto;
+      background: #1a1a1e;
+      border-radius: 12px;
+      padding: 16px;
+      font-size: 0.875rem;
+      line-height: 1.6;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    #transcript:empty::before {
+      content: "Conversation will appear here…";
+      color: #555;
+    }
+
+    .line { display: flex; gap: 8px; }
+    .line .speaker { font-weight: 700; min-width: 56px; }
+    .line.user  .speaker { color: #5b9bd5; }
+    .line.agent .speaker { color: #5dab74; }
+    .line.system { color: #888; font-style: italic; }
+  </style>
+</head>
+<body>
+  <h1>Vanos Voice Agent</h1>
+  <p id="status">Press the button to start</p>
+
+  <button id="btn" title="Start / Stop">
+    <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+      <path d="M12 1a4 4 0 0 1 4 4v6a4 4 0 0 1-8 0V5a4 4 0 0 1 4-4zm6.5 9a1 1 0 0 1 1 1 7.5 7.5 0 0 1-15 0 1 1 0 1 1 2 0 5.5 5.5 0 0 0 11 0 1 1 0 0 1 1-1zM12 19a1 1 0 0 1 1 1v2a1 1 0 1 1-2 0v-2a1 1 0 0 1 1-1z"/>
+    </svg>
+  </button>
+
+  <div id="transcript"></div>
+
+  <script>
+  (() => {
+    // ── Constants ───────────────────────────────────────────────────────────
+    const WS_URL              = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}`;
+    const MIC_RATE            = 48000;
+    const PLAYBACK_RATE       = 24000;
+    const AUDIO_TAG           = 0x01;
+    const MAX_RECONNECT       = 5;
+    const RECONNECT_DELAY_MS  = 3000;
+
+    // ── State ───────────────────────────────────────────────────────────────
+    let ws               = null;
+    let audioCtx         = null;
+    let micStream        = null;
+    let workletNode      = null;
+    let sourceNode       = null;
+    let isRunning        = false;
+    let isManualStop     = false;
+    let sessionStarting  = false;   // guards against double-click race
+    let reconnectAttempts = 0;
+    let reconnectTimeout  = null;
+    let nextPlayTime      = 0;
+
+    // ── DOM ─────────────────────────────────────────────────────────────────
+    const btn          = document.getElementById("btn");
+    const statusEl     = document.getElementById("status");
+    const transcriptEl = document.getElementById("transcript");
+
+    btn.addEventListener("click", () => {
+      if (!isRunning) startSession();
+      else            stopSession();
+    });
+
+    // ── Session lifecycle ────────────────────────────────────────────────────
+
+    async function startSession() {
+      // Prevent a second click while we're still setting up
+      if (sessionStarting || isRunning) return;
+      sessionStarting = true;
+      btn.disabled    = true;
+
+      isManualStop      = false;
+      reconnectAttempts = 0;
+
+      setStatus("Requesting mic access…", "");
+
+      try {
+        micStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            channelCount:     1,
+            sampleRate:       MIC_RATE,
+            echoCancellation: true,
+            noiseSuppression: true,
+          }
+        });
+      } catch (err) {
+        setStatus("Mic access denied — " + err.message, "error");
+        sessionStarting = false;
+        btn.disabled    = false;
+        return;
+      }
+
+      // Always create a fresh AudioContext with the correct sample rate
+      audioCtx = new AudioContext({ sampleRate: MIC_RATE });
+
+      try {
+        await audioCtx.audioWorklet.addModule("processor.js");
+      } catch (err) {
+        setStatus("Failed to load audio processor", "error");
+        await teardownAudio();
+        sessionStarting = false;
+        btn.disabled    = false;
+        return;
+      }
+
+      sourceNode  = audioCtx.createMediaStreamSource(micStream);
+      workletNode = new AudioWorkletNode(audioCtx, "mic-processor");
+
+      workletNode.port.onmessage = (e) => {
+        if (ws && ws.readyState === WebSocket.OPEN) ws.send(e.data);
+      };
+
+      sourceNode.connect(workletNode);
+      // workletNode intentionally NOT connected to destination — we don't want mic echo
+
+      sessionStarting = false;
+      connectWebSocket();
+    }
+
+    function connectWebSocket() {
+      if (isManualStop) return;
+
+      setStatus("Connecting…", "");
+      btn.disabled = true;
+
+      ws = new WebSocket(WS_URL);
+      ws.binaryType = "arraybuffer";
+
+      ws.onopen = () => {
+        console.log("WebSocket opened");
+        reconnectAttempts = 0;
+        setStatus("Waiting for agent…", "");
+      };
+
+      ws.onmessage = handleServerMessage;
+
+      ws.onerror = () => {
+        console.error("WebSocket error");
+        setStatus("Connection error", "error");
+      };
+
+      ws.onclose = (e) => {
+        console.log("WebSocket closed:", e.code, e.reason);
+
+        // isManualStop covers both user-clicked-stop AND server-initiated call_ended
+        if (!isManualStop && reconnectAttempts < MAX_RECONNECT) {
+          reconnectAttempts++;
+          setStatus(`Connection lost. Reconnecting (${reconnectAttempts}/${MAX_RECONNECT})…`, "warning");
+          btn.classList.add("reconnecting");
+
+          reconnectTimeout = setTimeout(connectWebSocket, RECONNECT_DELAY_MS);
+        } else if (!isManualStop) {
+          setStatus("Connection failed. Please refresh the page.", "error");
+          fullCleanup();
+        }
+        // If isManualStop, fullCleanup was already called — nothing to do
+      };
+    }
+
+    function stopSession() {
+      isManualStop = true;
+      if (reconnectTimeout) {
+        clearTimeout(reconnectTimeout);
+        reconnectTimeout = null;
+      }
+      if (ws) ws.close();
+      fullCleanup();
+      setStatus("Session ended", "");
+    }
+
+    // ── Cleanup helpers ──────────────────────────────────────────────────────
+
+    /**
+     * Tears down the audio graph and mic stream.
+     * Returns a Promise so callers can await full AudioContext closure.
+     */
+    async function teardownAudio() {
+      if (workletNode) {
+        workletNode.port.postMessage("stop");
+        workletNode.disconnect();
+        workletNode = null;
+      }
+      if (sourceNode) {
+        sourceNode.disconnect();
+        sourceNode = null;
+      }
+      if (micStream) {
+        micStream.getTracks().forEach(t => t.stop());
+        micStream = null;
+      }
+      if (audioCtx) {
+        try { await audioCtx.close(); } catch (_) {}
+        audioCtx = null;
+      }
+    }
+
+    /**
+     * Full session teardown: audio graph + UI reset.
+     * Safe to call multiple times.
+     */
+    async function fullCleanup() {
+      isRunning    = false;
+      nextPlayTime = 0;
+      ws           = null;
+
+      btn.disabled = false;
+      btn.classList.remove("listening", "speaking", "reconnecting");
+
+      await teardownAudio();
+    }
+
+    // ── Server message handler ───────────────────────────────────────────────
+
+    function handleServerMessage(event) {
+      // Binary frame = tagged audio
+      if (event.data instanceof ArrayBuffer) {
+        const view = new Uint8Array(event.data);
+        if (view[0] === AUDIO_TAG) enqueueAudio(event.data.slice(1));
+        return;
+      }
+
+      let msg;
+      try { msg = JSON.parse(event.data); } catch (_) { return; }
+
+      switch (msg.type) {
+
+        case "ready":
+          setStatus("Connected — speak now", "success");
+          btn.classList.add("listening");
+          btn.disabled = false;
+          isRunning    = true;
+          appendSystemMessage("Agent ready");
+          break;
+
+        /**
+         * call_ended: server finished saying goodbye and closed cleanly.
+         * Mark as manual stop so the ws.onclose handler won't try to reconnect.
+         */
+        case "call_ended":
+          isManualStop = true;
+          // Stop the worklet from sending any more mic audio immediately
+          if (workletNode) {
+            workletNode.port.postMessage("stop");
+            workletNode.disconnect();
+            workletNode = null;
+          }
+          if (sourceNode) {
+            sourceNode.disconnect();
+            sourceNode = null;
+          }
+          if (micStream) {
+            micStream.getTracks().forEach(t => t.stop());
+            micStream = null;
+          }
+          setStatus("Call ended", "");
+          appendSystemMessage("Call ended");
+          // Wait for the audio queue to finish playing before destroying AudioContext
+          // nextPlayTime is when the last scheduled chunk finishes
+          if (audioCtx && nextPlayTime > audioCtx.currentTime) {
+            const remaining = (nextPlayTime - audioCtx.currentTime) * 1000;
+            setTimeout(() => fullCleanup(), remaining + 200);
+          } else {
+            fullCleanup();
+          }
+          break;
+
+        case "agent_done":
+          btn.classList.remove("speaking");
+          btn.classList.add("listening");
+          setStatus("Your turn — speak now", "success");
+          break;
+
+        case "user_speaking":
+          // Interrupt any pending queued audio — reset play cursor
+          nextPlayTime = 0;
+          btn.classList.remove("speaking");
+          btn.classList.add("listening");
+          setStatus("Listening…", "success");
+          break;
+
+        case "transcript":
+          appendTranscript(msg.data);
+          break;
+
+        case "error":
+          setStatus(msg.message, "error");
+          appendSystemMessage("Error: " + msg.message);
+          break;
+      }
+    }
+
+    // ── Audio playback ───────────────────────────────────────────────────────
+
+    function enqueueAudio(arrayBuffer) {
+      if (!audioCtx) return;
+
+      btn.classList.remove("listening");
+      btn.classList.add("speaking");
+      setStatus("Agent speaking…", "success");
+
+      const int16   = new Int16Array(arrayBuffer);
+      const float32 = new Float32Array(int16.length);
+      for (let i = 0; i < int16.length; i++) {
+        float32[i] = int16[i] / (int16[i] < 0 ? 32768 : 32767);
+      }
+
+      const buffer = audioCtx.createBuffer(1, float32.length, PLAYBACK_RATE);
+      buffer.getChannelData(0).set(float32);
+
+      const source = audioCtx.createBufferSource();
+      source.buffer = buffer;
+      source.connect(audioCtx.destination);
+
+      const now = audioCtx.currentTime;
+
+      // If the queue has drifted into the past (e.g. after user interruption),
+      // restart with a small lead-in buffer
+      if (nextPlayTime < now + 0.05) nextPlayTime = now + 0.15;
+
+      source.start(nextPlayTime);
+      nextPlayTime += buffer.duration;
+    }
+
+    // ── UI helpers ───────────────────────────────────────────────────────────
+
+    function setStatus(msg, type) {
+      statusEl.textContent = msg;
+      statusEl.className   = type;
+    }
+
+    function appendTranscript(data) {
+      if (!data?.content) return;
+      const role = data.role === "assistant" ? "agent" : "user";
+      const line = document.createElement("div");
+      line.className = `line ${role}`;
+      line.innerHTML = `<span class="speaker">${role === "agent" ? "Emma" : "You"}:</span><span>${escapeHtml(data.content)}</span>`;
+      transcriptEl.appendChild(line);
+      transcriptEl.scrollTop = transcriptEl.scrollHeight;
+    }
+
+    function appendSystemMessage(msg) {
+      const line = document.createElement("div");
+      line.className  = "line system";
+      line.textContent = msg;
+      transcriptEl.appendChild(line);
+      transcriptEl.scrollTop = transcriptEl.scrollHeight;
+    }
+
+    function escapeHtml(str) {
+      return str
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
+    }
+  })();
+  </script>
+</body>
+</html>
