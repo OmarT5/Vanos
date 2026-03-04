@@ -3,23 +3,32 @@ const { createClient, AgentEvents } = require("@deepgram/sdk");
 const { WebSocketServer } = require("ws");
 const http = require("http");
 const { createClient: createRedisClient } = require("redis");
+const nodemailer = require("nodemailer");
 
 const PORT = process.env.PORT || 3001;
 const MAX_CONNECTIONS_PER_IP = 3;
 const RATE_LIMIT_WINDOW_MS = 60000;
 const MAX_REQUESTS_PER_WINDOW = 10;
-const DEMO_DURATION_MS = 10 * 60 * 1000; // 10 minutes in ms
+const DEMO_DURATION_MS = 10 * 60 * 1000;
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
 
 const deepgram = createClient(process.env.DEEPGRAM_API_KEY);
-
 const connectionCounts = new Map();
 const requestTimestamps = new Map();
 
-// ── Redis client ──────────────────────────────────────────────────────────────
+// ── Redis ─────────────────────────────────────────────────────────────────────
 const redis = createRedisClient({ url: process.env.REDIS_URL });
 redis.on("error", (err) => console.error("Redis error:", err));
 redis.connect().then(() => console.log("Redis connected"));
+
+// ── Nodemailer (Gmail) ────────────────────────────────────────────────────────
+const transporter = nodemailer.createTransport({
+  service: "gmail",
+  auth: {
+    user: process.env.GMAIL_USER,
+    pass: process.env.GMAIL_APP_PASSWORD,
+  },
+});
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function parseBody(req) {
@@ -48,92 +57,153 @@ function generateSessionToken() {
   return require("crypto").randomBytes(32).toString("hex");
 }
 
+function generateOTP() {
+  return Math.floor(100000 + Math.random() * 900000).toString();
+}
+
 // ── Google token verification ─────────────────────────────────────────────────
 async function verifyGoogleToken(idToken) {
   try {
     const { OAuth2Client } = require("google-auth-library");
     const client = new OAuth2Client(GOOGLE_CLIENT_ID);
-    const ticket = await client.verifyIdToken({
-      idToken,
-      audience: GOOGLE_CLIENT_ID,
-    });
+    const ticket = await client.verifyIdToken({ idToken, audience: GOOGLE_CLIENT_ID });
     const payload = ticket.getPayload();
-    return {
-      email: payload.email,
-      firstName: payload.given_name || "",
-      lastName: payload.family_name || "",
-    };
+    return { email: payload.email, firstName: payload.given_name || "", lastName: payload.family_name || "" };
   } catch (err) {
     console.error("Google token verification failed:", err.message);
     return null;
   }
 }
 
-// ── Session routes ────────────────────────────────────────────────────────────
-
-// POST /session/start
-// Body: { email, firstName, lastName } OR { googleToken }
-async function handleSessionStart(req, res) {
-  const body = await parseBody(req);
-  let email, firstName, lastName;
-
-  if (body.googleToken) {
-    const googleUser = await verifyGoogleToken(body.googleToken);
-    if (!googleUser) return sendJSON(res, 401, { error: "Invalid Google token" });
-    ({ email, firstName, lastName } = googleUser);
-  } else {
-    email = (body.email || "").trim().toLowerCase();
-    firstName = (body.firstName || "").trim();
-    lastName = (body.lastName || "").trim();
-    if (!email || !email.includes("@")) {
-      return sendJSON(res, 400, { error: "Valid email required" });
-    }
-    if (!firstName) return sendJSON(res, 400, { error: "First name required" });
-  }
-
+// ── Session helpers ───────────────────────────────────────────────────────────
+async function createOrGetSession(email, firstName, lastName) {
   const redisKey = `demo:${email}`;
   const existing = await redis.hGetAll(redisKey);
 
   let remainingMs;
-  let sessionToken;
+  const sessionToken = generateSessionToken();
 
   if (existing && existing.remainingMs !== undefined) {
-    // Returning user — use their remaining time
     remainingMs = parseInt(existing.remainingMs, 10);
-    sessionToken = existing.sessionToken;
-
-    // Refresh session token on each login for security
-    sessionToken = generateSessionToken();
     await redis.hSet(redisKey, "sessionToken", sessionToken);
   } else {
-    // New user — create record
     remainingMs = DEMO_DURATION_MS;
-    sessionToken = generateSessionToken();
     await redis.hSet(redisKey, {
-      email,
-      firstName,
-      lastName,
+      email, firstName, lastName,
       remainingMs: DEMO_DURATION_MS.toString(),
       sessionToken,
       createdAt: Date.now().toString(),
     });
   }
 
-  // Map sessionToken → email for sync lookups
-  await redis.set(`token:${sessionToken}`, email, { EX: 60 * 60 * 24 * 30 }); // 30 days
-
+  await redis.set(`token:${sessionToken}`, email, { EX: 60 * 60 * 24 * 30 });
   console.log(`[Session] ${email} — ${Math.round(remainingMs / 1000)}s remaining`);
+  return { sessionToken, remainingMs, firstName };
+}
 
-  return sendJSON(res, 200, {
-    sessionToken,
-    remainingMs,
-    firstName,
-    email,
-  });
+// ── Routes ────────────────────────────────────────────────────────────────────
+
+// POST /session/send-otp
+async function handleSendOtp(req, res) {
+  const body = await parseBody(req);
+  const email     = (body.email || "").trim().toLowerCase();
+  const firstName = (body.firstName || "").trim();
+  const lastName  = (body.lastName || "").trim();
+
+  if (!email || !email.includes("@")) return sendJSON(res, 400, { error: "Valid email required" });
+  if (!firstName) return sendJSON(res, 400, { error: "First name required" });
+
+  // Rate limit OTP sends — max 3 per email per 10 minutes
+  const rateLimitKey = `otp_rate:${email}`;
+  const sendCount = await redis.incr(rateLimitKey);
+  if (sendCount === 1) await redis.expire(rateLimitKey, 600); // 10 min window
+  if (sendCount > 3) {
+    return sendJSON(res, 429, { error: "Too many attempts. Please wait 10 minutes." });
+  }
+
+  const otp = generateOTP();
+  const otpKey = `otp:${email}`;
+
+  // Store OTP with 10 minute expiry alongside user details
+  await redis.hSet(otpKey, { otp, firstName, lastName, email });
+  await redis.expire(otpKey, 600);
+
+  // Send email
+  try {
+    await transporter.sendMail({
+      from: `"VANOS AI" <${process.env.GMAIL_USER}>`,
+      to: email,
+      subject: "Your VANOS Demo Access Code",
+      html: `
+        <div style="font-family: -apple-system, sans-serif; max-width: 480px; margin: 0 auto; padding: 40px 24px; background: #000; color: #fff;">
+          <div style="margin-bottom: 32px;">
+            <span style="display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #f97316; margin-right: 8px;"></span>
+            <span style="font-size: 12px; letter-spacing: 0.3em; color: rgba(255,255,255,0.4); text-transform: uppercase;">VANOS AI</span>
+          </div>
+          <h1 style="font-size: 28px; font-weight: 700; margin: 0 0 12px; color: #fff;">Your access code</h1>
+          <p style="color: rgba(255,255,255,0.5); font-size: 15px; line-height: 1.6; margin: 0 0 32px;">
+            Hi ${firstName}, use the code below to access your 10-minute VANOS demo.
+          </p>
+          <div style="background: rgba(249,115,22,0.08); border: 1px solid rgba(249,115,22,0.25); border-radius: 12px; padding: 24px; text-align: center; margin-bottom: 32px;">
+            <span style="font-size: 42px; font-weight: 700; letter-spacing: 0.3em; color: #f97316;">${otp}</span>
+          </div>
+          <p style="color: rgba(255,255,255,0.3); font-size: 13px; margin: 0;">
+            This code expires in 10 minutes. If you didn't request this, ignore this email.
+          </p>
+        </div>
+      `,
+    });
+    console.log(`[OTP] Sent to ${email}`);
+    return sendJSON(res, 200, { success: true });
+  } catch (err) {
+    console.error("Email send failed:", err.message);
+    return sendJSON(res, 500, { error: "Failed to send email. Please try again." });
+  }
+}
+
+// POST /session/verify-otp
+async function handleVerifyOtp(req, res) {
+  const body = await parseBody(req);
+  const email = (body.email || "").trim().toLowerCase();
+  const otp   = (body.otp || "").trim();
+
+  if (!email || !otp) return sendJSON(res, 400, { error: "Email and OTP required" });
+
+  const otpKey = `otp:${email}`;
+  const stored = await redis.hGetAll(otpKey);
+
+  if (!stored || !stored.otp) {
+    return sendJSON(res, 400, { error: "Code expired. Please request a new one." });
+  }
+
+  if (stored.otp !== otp) {
+    return sendJSON(res, 401, { error: "Incorrect code. Please try again." });
+  }
+
+  // OTP valid — delete it so it can't be reused
+  await redis.del(otpKey);
+
+  // Create or retrieve session
+  const session = await createOrGetSession(email, stored.firstName, stored.lastName);
+  return sendJSON(res, 200, session);
+}
+
+// POST /session/start (Google OAuth path only)
+async function handleSessionStart(req, res) {
+  const body = await parseBody(req);
+
+  if (!body.googleToken) {
+    return sendJSON(res, 400, { error: "Use /session/send-otp for email sign-in" });
+  }
+
+  const googleUser = await verifyGoogleToken(body.googleToken);
+  if (!googleUser) return sendJSON(res, 401, { error: "Invalid Google token" });
+
+  const session = await createOrGetSession(googleUser.email, googleUser.firstName, googleUser.lastName);
+  return sendJSON(res, 200, session);
 }
 
 // POST /session/sync
-// Body: { sessionToken, elapsedMs }
 async function handleSessionSync(req, res) {
   const body = await parseBody(req);
   const { sessionToken, elapsedMs } = body;
@@ -151,13 +221,12 @@ async function handleSessionSync(req, res) {
 
   const currentRemaining = parseInt(existing.remainingMs, 10);
   const newRemaining = Math.max(0, currentRemaining - Math.round(elapsedMs));
-
   await redis.hSet(redisKey, "remainingMs", newRemaining.toString());
 
   return sendJSON(res, 200, { remainingMs: newRemaining });
 }
 
-// GET /session/status?token=xxx
+// GET /session/status
 async function handleSessionStatus(req, res) {
   const url = new URL(req.url, `http://localhost`);
   const sessionToken = url.searchParams.get("token");
@@ -167,17 +236,13 @@ async function handleSessionStatus(req, res) {
   const email = await redis.get(`token:${sessionToken}`);
   if (!email) return sendJSON(res, 401, { error: "Invalid or expired session" });
 
-  const redisKey = `demo:${email}`;
-  const existing = await redis.hGetAll(redisKey);
+  const existing = await redis.hGetAll(`demo:${email}`);
   if (!existing) return sendJSON(res, 404, { error: "Session not found" });
 
-  return sendJSON(res, 200, {
-    remainingMs: parseInt(existing.remainingMs, 10),
-    email,
-  });
+  return sendJSON(res, 200, { remainingMs: parseInt(existing.remainingMs, 10), email });
 }
 
-// Clean up stale rate-limit timestamps every 5 minutes
+// ── Rate limit cleanup ────────────────────────────────────────────────────────
 setInterval(() => {
   const now = Date.now();
   for (const [ip, timestamps] of requestTimestamps.entries()) {
@@ -187,9 +252,8 @@ setInterval(() => {
   }
 }, 300000);
 
-// ── Static file server + API router ──────────────────────────────────────────
+// ── HTTP server ───────────────────────────────────────────────────────────────
 const server = http.createServer(async (req, res) => {
-  // Handle CORS preflight
   if (req.method === "OPTIONS") {
     res.writeHead(204, {
       "Access-Control-Allow-Origin": "*",
@@ -200,42 +264,28 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // ── API routes ──
-  if (req.method === "POST" && req.url === "/session/start") {
-    return handleSessionStart(req, res);
-  }
-  if (req.method === "POST" && req.url === "/session/sync") {
-    return handleSessionSync(req, res);
-  }
-  if (req.method === "GET" && req.url?.startsWith("/session/status")) {
-    return handleSessionStatus(req, res);
-  }
+  if (req.method === "POST" && req.url === "/session/send-otp")   return handleSendOtp(req, res);
+  if (req.method === "POST" && req.url === "/session/verify-otp") return handleVerifyOtp(req, res);
+  if (req.method === "POST" && req.url === "/session/start")      return handleSessionStart(req, res);
+  if (req.method === "POST" && req.url === "/session/sync")       return handleSessionSync(req, res);
+  if (req.method === "GET"  && req.url?.startsWith("/session/status")) return handleSessionStatus(req, res);
 
-  // ── Static file serving ──
-  const fs = require("fs");
+  // Static files
+  const fs   = require("fs");
   const path = require("path");
-
   let filePath = req.url === "/" || req.url === "/index.html"
     ? "./dist/index.html"
     : path.join("./dist", req.url);
 
   const ext = path.extname(filePath);
   const mimeTypes = {
-    ".js": "application/javascript",
-    ".css": "text/css",
-    ".html": "text/html",
-    ".png": "image/png",
-    ".jpg": "image/jpeg",
-    ".svg": "image/svg+xml",
-    ".json": "application/json",
-    ".woff": "font/woff",
-    ".woff2": "font/woff2",
+    ".js": "application/javascript", ".css": "text/css", ".html": "text/html",
+    ".png": "image/png", ".jpg": "image/jpeg", ".svg": "image/svg+xml",
+    ".json": "application/json", ".woff": "font/woff", ".woff2": "font/woff2",
   };
-  const contentType = mimeTypes[ext] || "text/html";
 
   fs.readFile(filePath, (err, data) => {
     if (err) {
-      // SPA fallback — serve index.html for unknown routes
       fs.readFile("./dist/index.html", (err2, indexData) => {
         if (err2) { res.writeHead(404); res.end("Not found"); return; }
         res.writeHead(200, { "Content-Type": "text/html" });
@@ -243,29 +293,21 @@ const server = http.createServer(async (req, res) => {
       });
       return;
     }
-    res.writeHead(200, { "Content-Type": contentType });
+    res.writeHead(200, { "Content-Type": mimeTypes[ext] || "text/html" });
     res.end(data);
   });
 });
 
-// ── WebSocket server ──────────────────────────────────────────────────────────
-const wss = new WebSocketServer({
-  server,
-  maxPayload: 1024 * 1024,
-});
+// ── WebSocket ─────────────────────────────────────────────────────────────────
+const wss = new WebSocketServer({ server, maxPayload: 1024 * 1024 });
 
 wss.on("connection", (browserSocket, req) => {
   const clientIP = req.socket.remoteAddress;
   console.log(`[${new Date().toISOString()}] Browser connected from ${clientIP}`);
 
-  // ── Rate limiting ────────────────────────────────────────────────────────
   const currentConnections = connectionCounts.get(clientIP) || 0;
   if (currentConnections >= MAX_CONNECTIONS_PER_IP) {
-    console.warn(`[${clientIP}] Rate limit: too many concurrent connections`);
-    browserSocket.send(JSON.stringify({
-      type: "error",
-      message: "Too many connections from your IP. Please try again later."
-    }));
+    browserSocket.send(JSON.stringify({ type: "error", message: "Too many connections from your IP." }));
     browserSocket.close();
     return;
   }
@@ -273,13 +315,8 @@ wss.on("connection", (browserSocket, req) => {
   const now = Date.now();
   const timestamps = requestTimestamps.get(clientIP) || [];
   const recentRequests = timestamps.filter(t => now - t < RATE_LIMIT_WINDOW_MS);
-
   if (recentRequests.length >= MAX_REQUESTS_PER_WINDOW) {
-    console.warn(`[${clientIP}] Rate limit: too many requests`);
-    browserSocket.send(JSON.stringify({
-      type: "error",
-      message: "Rate limit exceeded. Please wait before reconnecting."
-    }));
+    browserSocket.send(JSON.stringify({ type: "error", message: "Rate limit exceeded." }));
     browserSocket.close();
     return;
   }
@@ -288,7 +325,6 @@ wss.on("connection", (browserSocket, req) => {
   requestTimestamps.set(clientIP, recentRequests);
   connectionCounts.set(clientIP, currentConnections + 1);
 
-  // ── Per-connection state ─────────────────────────────────────────────────
   let agentReady = false;
   const pendingAudio = [];
   let stripNextWavHeader = false;
@@ -297,21 +333,17 @@ wss.on("connection", (browserSocket, req) => {
   let reconnectAttempts = 0;
   const MAX_RECONNECT_ATTEMPTS = 3;
   let isShuttingDown = false;
-
   let callEnding = false;
   let pendingFarewell = false;
 
-  // ── Deepgram connection ──────────────────────────────────────────────────
   function connectToDeepgram() {
     if (isShuttingDown) return;
-
     try {
       deepgramConnection = deepgram.agent();
 
       deepgramConnection.on(AgentEvents.Open, () => {
         console.log(`[${clientIP}] Deepgram WS opened`);
         reconnectAttempts = 0;
-
         deepgramConnection.configure({
           audio: {
             input:  { encoding: "linear16", sample_rate: 48000 },
@@ -319,18 +351,9 @@ wss.on("connection", (browserSocket, req) => {
           },
           agent: {
             language: "en",
-            listen: {
-              provider: {
-                type: "deepgram",
-                version: "v2",
-                model: "flux-general-en"
-              }
-            },
+            listen: { provider: { type: "deepgram", version: "v2", model: "flux-general-en" } },
             think: {
-              provider: {
-                type: "google",
-                model: "gemini-2.5-flash"
-              },
+              provider: { type: "google", model: "gemini-2.5-flash" },
               prompt: `AGENT_NAME = 'Vanos'
 GENDER = 'Artificial female'
 PRODUCT = 'VANOS AI'
@@ -453,42 +476,31 @@ Do not use [DIAL_OPERATOR] unless explicitly instructed.`
         });
       });
 
-      deepgramConnection.on(AgentEvents.Welcome, () => {
-        console.log(`[${clientIP}] Deepgram welcomed`);
-      });
+      deepgramConnection.on(AgentEvents.Welcome, () => console.log(`[${clientIP}] Deepgram welcomed`));
 
       deepgramConnection.on(AgentEvents.SettingsApplied, () => {
         console.log(`[${clientIP}] Settings applied — agent live`);
         agentReady = true;
-
         if (browserSocket.readyState === browserSocket.OPEN) {
           browserSocket.send(JSON.stringify({ type: "ready" }));
         }
-
         for (const chunk of pendingAudio) deepgramConnection.send(chunk);
         pendingAudio.length = 0;
       });
 
       keepAliveInterval = setInterval(() => {
-        if (deepgramConnection) {
-          try { deepgramConnection.keepAlive(); } catch (_) {}
-        }
+        if (deepgramConnection) { try { deepgramConnection.keepAlive(); } catch (_) {} }
       }, 5000);
 
-      deepgramConnection.on(AgentEvents.AgentStartedSpeaking, () => {
-        stripNextWavHeader = true;
-      });
+      deepgramConnection.on(AgentEvents.AgentStartedSpeaking, () => { stripNextWavHeader = true; });
 
       deepgramConnection.on(AgentEvents.Audio, (data) => {
         if (browserSocket.readyState !== browserSocket.OPEN) return;
-
         let payload = Buffer.from(data);
-
         if (stripNextWavHeader && payload.length >= 44 && payload[0] === 0x52) {
           payload = payload.slice(44);
           stripNextWavHeader = false;
         }
-
         if (payload.length === 0) return;
         browserSocket.send(Buffer.concat([Buffer.from([0x01]), payload]));
       });
@@ -497,27 +509,15 @@ Do not use [DIAL_OPERATOR] unless explicitly instructed.`
         if (browserSocket.readyState === browserSocket.OPEN) {
           browserSocket.send(JSON.stringify({ type: "agent_done" }));
         }
-
         if (pendingFarewell && !isShuttingDown) {
-          console.log(`[${clientIP}] AgentAudioDone + farewell flagged → ending call`);
           pendingFarewell = false;
-          isShuttingDown  = true;
-
+          isShuttingDown = true;
           if (browserSocket.readyState === browserSocket.OPEN) {
-            browserSocket.send(JSON.stringify({
-              type: "call_ended",
-              message: "Call ended"
-            }));
+            browserSocket.send(JSON.stringify({ type: "call_ended", message: "Call ended" }));
           }
-
           setTimeout(() => {
-            if (deepgramConnection) {
-              try { deepgramConnection.disconnect(); } catch (_) {}
-              deepgramConnection = null;
-            }
-            if (browserSocket.readyState === browserSocket.OPEN) {
-              browserSocket.close();
-            }
+            if (deepgramConnection) { try { deepgramConnection.disconnect(); } catch (_) {} deepgramConnection = null; }
+            if (browserSocket.readyState === browserSocket.OPEN) browserSocket.close();
             cleanup(true);
           }, 3000);
         }
@@ -533,58 +533,36 @@ Do not use [DIAL_OPERATOR] unless explicitly instructed.`
         if (browserSocket.readyState === browserSocket.OPEN) {
           browserSocket.send(JSON.stringify({ type: "transcript", data }));
         }
-
         if (isShuttingDown || pendingFarewell) return;
-
         if (data?.role === "assistant" && data?.content) {
           const content = data.content.toLowerCase();
-          const farewellPhrases = [
-            "have a great day", "goodbye", "take care",
-            "talk to you soon", "feel free to reach out",
-            "have a wonderful day", "all the best"
-          ];
-
+          const farewellPhrases = ["have a great day","goodbye","take care","talk to you soon","feel free to reach out","have a wonderful day","all the best"];
           const matched = farewellPhrases.find(p => content.includes(p));
-          if (matched) {
-            console.log(`[${clientIP}] Farewell detected ("${matched}")`);
-            pendingFarewell = true;
-            callEnding      = true;
-          }
+          if (matched) { pendingFarewell = true; callEnding = true; }
         }
       });
 
       deepgramConnection.on("History", (data) => {
-        console.log(`[${clientIP}] History event:`, JSON.stringify(data));
         if (browserSocket.readyState === browserSocket.OPEN) {
           browserSocket.send(JSON.stringify({ type: "transcript", data }));
         }
       });
 
       deepgramConnection.on(AgentEvents.Error, (err) => {
-        console.error(`[${clientIP}] Deepgram error:`, err?.message || "undefined");
-
+        console.error(`[${clientIP}] Deepgram error:`, err?.message);
         if (isShuttingDown || browserSocket.readyState !== browserSocket.OPEN) return;
-
         if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
           reconnectAttempts++;
-          browserSocket.send(JSON.stringify({
-            type: "error",
-            message: "Connection issue. Attempting to reconnect..."
-          }));
+          browserSocket.send(JSON.stringify({ type: "error", message: "Connection issue. Attempting to reconnect..." }));
           setTimeout(() => { cleanup(false); connectToDeepgram(); }, 2000 * reconnectAttempts);
         } else {
-          browserSocket.send(JSON.stringify({
-            type: "error",
-            message: "Unable to establish connection. Please refresh the page."
-          }));
+          browserSocket.send(JSON.stringify({ type: "error", message: "Unable to establish connection. Please refresh." }));
           cleanup(true);
         }
       });
 
       deepgramConnection.on(AgentEvents.Close, () => {
-        console.log(`[${clientIP}] Deepgram connection closed`);
         if (isShuttingDown || browserSocket.readyState !== browserSocket.OPEN) return;
-
         if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
           reconnectAttempts++;
           setTimeout(() => { cleanup(false); connectToDeepgram(); }, 2000);
@@ -593,28 +571,18 @@ Do not use [DIAL_OPERATOR] unless explicitly instructed.`
 
       deepgramConnection.on(AgentEvents.Unhandled, (data) => {
         if (data?.type === "History") {
-          console.log(`[${clientIP}] History via Unhandled:`, JSON.stringify(data));
           if (!isShuttingDown && !pendingFarewell && data?.role === "assistant" && data?.content) {
             const content = data.content.toLowerCase();
             const farewellPhrases = ["have a great day","goodbye","take care","talk to you soon","feel free to reach out","have a wonderful day","all the best"];
-            const matched = farewellPhrases.find(p => content.includes(p));
-            if (matched) {
-              pendingFarewell = true;
-              callEnding      = true;
-            }
+            if (farewellPhrases.find(p => content.includes(p))) { pendingFarewell = true; callEnding = true; }
           }
-        } else {
-          console.log(`[${clientIP}] Unhandled event:`, data?.type || "unknown");
         }
       });
 
     } catch (err) {
       console.error(`[${clientIP}] Failed to connect to Deepgram:`, err.message);
       if (browserSocket.readyState === browserSocket.OPEN) {
-        browserSocket.send(JSON.stringify({
-          type: "error",
-          message: "Failed to initialize voice agent. Please try again."
-        }));
+        browserSocket.send(JSON.stringify({ type: "error", message: "Failed to initialize voice agent." }));
       }
       cleanup(true);
     }
@@ -622,66 +590,42 @@ Do not use [DIAL_OPERATOR] unless explicitly instructed.`
 
   browserSocket.on("message", (msg) => {
     if (isShuttingDown || callEnding) return;
-
     if (Buffer.isBuffer(msg) || msg instanceof ArrayBuffer) {
       const chunk = Buffer.isBuffer(msg) ? msg : Buffer.from(msg);
-
-      if (chunk.length > 96000) {
-        console.warn(`[${clientIP}] Oversized audio chunk: ${chunk.length} bytes — dropping`);
-        return;
-      }
-
+      if (chunk.length > 96000) return;
       if (agentReady && deepgramConnection) {
-        try { deepgramConnection.send(chunk); }
-        catch (err) { console.error(`[${clientIP}] Failed to send audio:`, err.message); }
+        try { deepgramConnection.send(chunk); } catch (err) { console.error(`[${clientIP}] Audio send failed:`, err.message); }
       } else {
         pendingAudio.push(chunk);
         if (pendingAudio.length > 100) pendingAudio.shift();
       }
       return;
     }
-
-    try {
-      const event = JSON.parse(msg.toString());
-      console.log(`[${clientIP}] Browser control:`, event);
-    } catch (_) {}
+    try { const event = JSON.parse(msg.toString()); console.log(`[${clientIP}] Control:`, event); } catch (_) {}
   });
 
-  function cleanup(decrementConnectionCount = true) {
+  function cleanup(decrement = true) {
     if (keepAliveInterval) { clearInterval(keepAliveInterval); keepAliveInterval = null; }
-    if (deepgramConnection) {
-      try { deepgramConnection.disconnect(); } catch (_) {}
-      deepgramConnection = null;
-    }
+    if (deepgramConnection) { try { deepgramConnection.disconnect(); } catch (_) {} deepgramConnection = null; }
     agentReady = false;
     pendingAudio.length = 0;
     pendingFarewell = false;
     callEnding = false;
-
-    if (decrementConnectionCount) {
+    if (decrement) {
       const count = connectionCounts.get(clientIP) || 0;
       if (count > 0) connectionCounts.set(clientIP, count - 1);
     }
   }
 
-  browserSocket.on("close", () => {
-    console.log(`[${clientIP}] Browser disconnected`);
-    isShuttingDown = true;
-    cleanup(true);
-  });
-
-  browserSocket.on("error", (err) => {
-    console.error(`[${clientIP}] Browser socket error:`, err.message);
-    isShuttingDown = true;
-    cleanup(true);
-  });
+  browserSocket.on("close", () => { isShuttingDown = true; cleanup(true); });
+  browserSocket.on("error", () => { isShuttingDown = true; cleanup(true); });
 
   connectToDeepgram();
 });
 
 // ── Graceful shutdown ─────────────────────────────────────────────────────────
 function gracefulShutdown(signal) {
-  console.log(`${signal} received, shutting down gracefully…`);
+  console.log(`${signal} received, shutting down…`);
   redis.quit();
   wss.clients.forEach(client => client.close());
   server.close(() => { console.log("Server closed"); process.exit(0); });
@@ -692,5 +636,4 @@ process.on("SIGINT",  () => gracefulShutdown("SIGINT"));
 
 server.listen(PORT, () => {
   console.log(`Server running → http://localhost:${PORT}`);
-  console.log(`Rate limiting: ${MAX_CONNECTIONS_PER_IP} connections/IP, ${MAX_REQUESTS_PER_WINDOW} requests/minute`);
 });
