@@ -69,21 +69,23 @@ function otpEmailHtml(firstName, otp) {
         <table width="520" cellpadding="0" cellspacing="0" style="max-width:520px;width:100%;">
 
           <!-- Header -->
-          <tr>
-            <td style="padding:0 0 40px 0;">
-              <table cellpadding="0" cellspacing="0">
-                <tr>
-                  <td>
-                    <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#f97316;margin-right:10px;vertical-align:middle;"></span>
-                  </td>
-                  <td>
-                    <span style="font-size:11px;letter-spacing:0.3em;color:rgba(255,255,255,0.35);text-transform:uppercase;font-weight:500;vertical-align:middle;">VANOS AI</span>
-                  </td>
-                </tr>
-              </table>
-            </td>
-          </tr>
-
+          <!-- Header -->
+<tr>
+  <td style="padding:0 0 40px 0;">
+    <table cellpadding="0" cellspacing="0">
+      <tr>
+        <td>
+          <img src="https://vanos-production.up.railway.app/vanos-icon.png" 
+               alt="VANOS" width="32" height="32" 
+               style="display:inline-block;vertical-align:middle;margin-right:10px;border-radius:6px;" />
+        </td>
+        <td>
+          <span style="font-size:11px;letter-spacing:0.3em;color:rgba(255,255,255,0.35);text-transform:uppercase;font-weight:500;vertical-align:middle;">VANOS AI</span>
+        </td>
+      </tr>
+    </table>
+  </td>
+</tr>
           <!-- Card -->
           <tr>
             <td style="background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);border-radius:20px;padding:48px 44px;">
@@ -131,16 +133,17 @@ function otpEmailHtml(firstName, otp) {
           </tr>
 
           <!-- Footer -->
-          <tr>
-            <td style="padding:28px 0 0 0;text-align:center;">
-              <p style="margin:0 0 6px;font-size:11px;color:rgba(255,255,255,0.15);letter-spacing:0.05em;">
-                VANOS AI · SPACEDOME · San Francisco
-              </p>
-              <p style="margin:0;font-size:11px;color:rgba(255,255,255,0.1);">
-                You're receiving this because you requested demo access at vanos.ai
-              </p>
-            </td>
-          </tr>
+<tr>
+  <td style="padding:28px 0 0 0;text-align:center;">
+    <p style="margin:0 0 6px;font-size:11px;color:#EAEAE4;letter-spacing:0.05em;opacity:0.5;">
+      VANOS AI · SPACEDOME · San Francisco
+    </p>
+    <p style="margin:0;font-size:11px;color:#EAEAE4;opacity:0.35;">
+      You're receiving this because you requested demo access at 
+      <a href="https://vanos.ai" style="color:#EAEAE4;text-decoration:underline;opacity:0.6;">vanos.ai</a>
+    </p>
+  </td>
+</tr>
 
         </table>
       </td>
