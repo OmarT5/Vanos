@@ -213,7 +213,7 @@ async function handleSendOtp(req, res) {
 
   try {
     const { error } = await resend.emails.send({
-      from: "VANOS AI <onboarding@resend.dev>",
+      from: "Vanos <no-reply@vanos.ai>",
       to: email,
       subject: `${otp} is your VANOS access code`,
       html: otpEmailHtml(firstName, otp),
