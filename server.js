@@ -172,13 +172,16 @@ async function createOrGetSession(email, firstName, lastName) {
   let remainingMs;
 
   if (existing && existing.remainingMs !== undefined) {
-    remainingMs = parseInt(existing.remainingMs, 10);
-    await redis.hSet(redisKey, "sessionToken", sessionToken);
+    const isSpacedome = email.endsWith("@spacedome.ai");
+    remainingMs = isSpacedome ? 99 * 60 * 60 * 1000 : parseInt(existing.remainingMs, 10);
+    await redis.hSet(redisKey, { sessionToken, remainingMs: remainingMs.toString() });
   } else {
-    remainingMs = DEMO_DURATION_MS;
+    // Spacedome team gets unlimited time
+    const isSpacedome = email.endsWith("@spacedome.ai");
+    remainingMs = isSpacedome ? 99 * 60 * 60 * 1000 : DEMO_DURATION_MS; // 99 hours vs 10 mins
     await redis.hSet(redisKey, {
       email, firstName, lastName,
-      remainingMs: DEMO_DURATION_MS.toString(),
+      remainingMs: remainingMs.toString(),
       sessionToken,
       createdAt: Date.now().toString(),
     });
