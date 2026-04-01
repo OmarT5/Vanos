@@ -169,31 +169,53 @@ async function verifyGoogleToken(idToken) {
 
 // ── Session helper ────────────────────────────────────────────────────────────
 async function createOrGetSession(email, firstName, lastName) {
-  const redisKey = `demo:${email}`;
-  const existing = await redis.hGetAll(redisKey);
   const sessionToken = generateSessionToken();
-  let remainingMs;
+  const isSpacedome = email.endsWith("@spacedome.ai");
 
-  if (existing && existing.remainingMs !== undefined) {
-    const isSpacedome = email.endsWith("@spacedome.ai");
-    remainingMs = isSpacedome ? 99 * 60 * 60 * 1000 : parseInt(existing.remainingMs, 10);
-    await redis.hSet(redisKey, { sessionToken, remainingMs: remainingMs.toString() });
-  } else {
-    // Spacedome team gets unlimited time
-    const isSpacedome = email.endsWith("@spacedome.ai");
-    remainingMs = isSpacedome ? 99 * 60 * 60 * 1000 : DEMO_DURATION_MS; // 99 hours vs 10 mins
-    await redis.hSet(redisKey, {
-      email, firstName, lastName,
-      remainingMs: remainingMs.toString(),
-      sessionToken,
-      createdAt: Date.now().toString(),
-    });
+  // Permanent user record (never deleted)
+  const userKey = `user:${email}`;
+  const userExists = await redis.exists(userKey);
+  if (!userExists) {
+    await redis.hSet(userKey, { email, firstName, lastName, createdAt: Date.now().toString() });
   }
 
+  let remainingMs;
+
+  if (isSpacedome) {
+    remainingMs = 99 * 60 * 60 * 1000;
+  } else {
+    // Daily quota key — expires in 24 hours automatically
+    const today = new Date().toISOString().slice(0, 10); // "2026-04-01"
+    const dailyKey = `daily:${email}:${today}`;
+
+    const stored = await redis.get(dailyKey);
+
+    if (stored !== null) {
+      remainingMs = parseInt(stored, 10);
+    } else {
+      // Fresh day — give them 10 mins, expire key at midnight UTC
+      remainingMs = DEMO_DURATION_MS;
+      const secondsUntilMidnight = getSecondsUntilMidnightUTC();
+      await redis.set(dailyKey, remainingMs.toString(), { EX: secondsUntilMidnight });
+    }
+  }
+
+  // Store session token → email mapping (30 days)
   await redis.set(`token:${sessionToken}`, email, { EX: 60 * 60 * 24 * 30 });
-  console.log(`[Session] ${email} — ${Math.round(remainingMs / 1000)}s remaining`);
+
+  console.log(`[Session] ${email} — ${Math.round(remainingMs / 1000)}s remaining today`);
   return { sessionToken, remainingMs, firstName };
 }
+
+// ---Helper Resets at Midnight
+
+function getSecondsUntilMidnightUTC() {
+  const now = new Date();
+  const midnight = new Date();
+  midnight.setUTCHours(24, 0, 0, 0); // next midnight UTC
+  return Math.floor((midnight - now) / 1000);
+}
+
 
 // ── Routes ────────────────────────────────────────────────────────────────────
 
@@ -272,16 +294,27 @@ async function handleSessionSync(req, res) {
   const body = await parseBody(req);
   const { sessionToken, elapsedMs } = body;
 
-  if (!sessionToken || typeof elapsedMs !== "number") return sendJSON(res, 400, { error: "sessionToken and elapsedMs required" });
+  if (!sessionToken || typeof elapsedMs !== "number")
+    return sendJSON(res, 400, { error: "sessionToken and elapsedMs required" });
 
   const email = await redis.get(`token:${sessionToken}`);
   if (!email) return sendJSON(res, 401, { error: "Invalid or expired session" });
 
-  const existing = await redis.hGetAll(`demo:${email}`);
-  if (!existing) return sendJSON(res, 404, { error: "Session not found" });
+  const isSpacedome = email.endsWith("@spacedome.ai");
+  if (isSpacedome) return sendJSON(res, 200, { remainingMs: 99 * 60 * 60 * 1000 });
 
-  const newRemaining = Math.max(0, parseInt(existing.remainingMs, 10) - Math.round(elapsedMs));
-  await redis.hSet(`demo:${email}`, "remainingMs", newRemaining.toString());
+  const today = new Date().toISOString().slice(0, 10);
+  const dailyKey = `daily:${email}:${today}`;
+
+  const stored = await redis.get(dailyKey);
+  if (stored === null) return sendJSON(res, 404, { error: "Session not found" });
+
+  const newRemaining = Math.max(0, parseInt(stored, 10) - Math.round(elapsedMs));
+  const secondsUntilMidnight = getSecondsUntilMidnightUTC();
+
+  // Preserve the TTL when updating
+  await redis.set(dailyKey, newRemaining.toString(), { EX: secondsUntilMidnight });
+
   return sendJSON(res, 200, { remainingMs: newRemaining });
 }
 
@@ -294,10 +327,16 @@ async function handleSessionStatus(req, res) {
   const email = await redis.get(`token:${sessionToken}`);
   if (!email) return sendJSON(res, 401, { error: "Invalid or expired session" });
 
-  const existing = await redis.hGetAll(`demo:${email}`);
-  if (!existing) return sendJSON(res, 404, { error: "Session not found" });
+  const isSpacedome = email.endsWith("@spacedome.ai");
+  if (isSpacedome) return sendJSON(res, 200, { remainingMs: 99 * 60 * 60 * 1000, email });
 
-  return sendJSON(res, 200, { remainingMs: parseInt(existing.remainingMs, 10), email });
+  const today = new Date().toISOString().slice(0, 10);
+  const dailyKey = `daily:${email}:${today}`;
+
+  const stored = await redis.get(dailyKey);
+  const remainingMs = stored !== null ? parseInt(stored, 10) : 0;
+
+  return sendJSON(res, 200, { remainingMs, email });
 }
 
 // ── Rate limit cleanup ────────────────────────────────────────────────────────
