@@ -75,9 +75,9 @@ function otpEmailHtml(firstName, otp) {
     <table cellpadding="0" cellspacing="0">
       <tr>
         <td>
-          <img src="https://vanos-production.up.railway.app/vanos-icon.png" 
+          <img src="https://vanos-production-5df9.up.railway.app/vanos-icon.png" 
                alt="VANOS" width="32" height="32" 
-               style="display:inline-block;vertical-align:middle;margin-right:10px;border-radius:6px;" />
+               style="display:inline-block;vertical-align:middle;margin-right:10px;border-radius:6px;margin-top:7px !important;" />
         </td>
         <td>
           <span style="font-size:11px;letter-spacing:0.3em;color:rgba(255,255,255,0.35);text-transform:uppercase;font-weight:500;vertical-align:middle;">VANOS AI</span>
