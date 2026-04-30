@@ -93,7 +93,7 @@ Error generating stack: `+a.message+`
   .spin          { animation: spin 0.75s linear infinite; }
   .fade-in       { animation: fade-in 0.5s ease both; }
   @media (max-width: 767px) {
-  .blinking-dot { margin-left: 2px; }
+  .blinking-dot { margin-left: 3px;top: 2px !important; }
 }
 
   .pill-btn {
