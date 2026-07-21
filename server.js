@@ -11,6 +11,7 @@ const RATE_LIMIT_WINDOW_MS = 60000;
 const MAX_REQUESTS_PER_WINDOW = 10;
 const DEMO_DURATION_MS = 10 * 60 * 1000;
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
+const PUBLIC_URL = process.env.PUBLIC_URL || "https://vanos-production-c921.up.railway.app";
 
 const deepgram = createClient(process.env.DEEPGRAM_API_KEY);
 const resend = new Resend(process.env.RESEND_API_KEY);
@@ -75,7 +76,7 @@ function otpEmailHtml(firstName, otp) {
     <table cellpadding="0" cellspacing="0">
       <tr>
         <td>
-          <img src="https://vanos-production-5df9.up.railway.app/vanos-icon.png" 
+          <img src="${PUBLIC_URL}/vanos-icon.png"
                alt="VANOS" width="32" height="32" 
                style="display:inline-block;vertical-align:middle;margin-right:10px;border-radius:6px;margin-top:7px !important;" />
         </td>
