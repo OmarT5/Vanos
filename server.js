@@ -10,7 +10,9 @@ const MAX_CONNECTIONS_PER_IP = 3;
 const RATE_LIMIT_WINDOW_MS = 60000;
 const MAX_REQUESTS_PER_WINDOW = 10;
 const DEMO_DURATION_MS = 10 * 60 * 1000;
-const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
+const UNLIMITED_MS = 99 * 60 * 60 * 1000;
+// Emails on these domains (or their subdomains) skip the daily quota
+const UNLIMITED_DOMAINS = ["spacedome.ai", "spacedome.com.pk", "ezagents.ai", "ezytech.global"];
 const PUBLIC_URL = process.env.PUBLIC_URL || "https://vanos-production-c921.up.railway.app";
 
 const deepgram = createClient(process.env.DEEPGRAM_API_KEY);
@@ -48,6 +50,11 @@ function sendJSON(res, statusCode, data) {
 
 function generateSessionToken() {
   return require("crypto").randomBytes(32).toString("hex");
+}
+
+function hasUnlimitedAccess(email) {
+  const domain = email.toLowerCase().split("@").pop();
+  return UNLIMITED_DOMAINS.some(d => domain === d || domain.endsWith(`.${d}`));
 }
 
 function generateOTP() {
@@ -154,24 +161,9 @@ function otpEmailHtml(firstName, otp) {
 </html>`;
 }
 
-// ── Google token verification ─────────────────────────────────────────────────
-async function verifyGoogleToken(idToken) {
-  try {
-    const { OAuth2Client } = require("google-auth-library");
-    const client = new OAuth2Client(GOOGLE_CLIENT_ID);
-    const ticket = await client.verifyIdToken({ idToken, audience: GOOGLE_CLIENT_ID });
-    const payload = ticket.getPayload();
-    return { email: payload.email, firstName: payload.given_name || "", lastName: payload.family_name || "" };
-  } catch (err) {
-    console.error("Google token verification failed:", err.message);
-    return null;
-  }
-}
-
 // ── Session helper ────────────────────────────────────────────────────────────
 async function createOrGetSession(email, firstName, lastName) {
   const sessionToken = generateSessionToken();
-  const isSpacedome = email.endsWith("@spacedome.ai");
 
   // Permanent user record (never deleted)
   const userKey = `user:${email}`;
@@ -182,8 +174,8 @@ async function createOrGetSession(email, firstName, lastName) {
 
   let remainingMs;
 
-  if (isSpacedome) {
-    remainingMs = 99 * 60 * 60 * 1000;
+  if (hasUnlimitedAccess(email)) {
+    remainingMs = UNLIMITED_MS;
   } else {
     // Daily quota key — expires in 24 hours automatically
     const today = new Date().toISOString().slice(0, 10); // "2026-04-01"
@@ -278,16 +270,23 @@ async function handleVerifyOtp(req, res) {
   return sendJSON(res, 200, session);
 }
 
-// POST /session/start — Google OAuth only
-async function handleSessionStart(req, res) {
-  const body = await parseBody(req);
-  if (!body.googleToken) return sendJSON(res, 400, { error: "Use /session/send-otp for email sign-in" });
+// Deduct elapsed talk time from today's quota. Returns new remainingMs, or null if no quota key.
+async function chargeElapsed(email, elapsedMs) {
+  if (hasUnlimitedAccess(email)) return UNLIMITED_MS;
 
-  const googleUser = await verifyGoogleToken(body.googleToken);
-  if (!googleUser) return sendJSON(res, 401, { error: "Invalid Google token" });
+  const today = new Date().toISOString().slice(0, 10);
+  const dailyKey = `daily:${email}:${today}`;
 
-  const session = await createOrGetSession(googleUser.email, googleUser.firstName, googleUser.lastName);
-  return sendJSON(res, 200, session);
+  const stored = await redis.get(dailyKey);
+  if (stored === null) return null;
+
+  const newRemaining = Math.max(0, parseInt(stored, 10) - Math.round(elapsedMs));
+  const secondsUntilMidnight = getSecondsUntilMidnightUTC();
+
+  // Preserve the TTL when updating
+  await redis.set(dailyKey, newRemaining.toString(), { EX: secondsUntilMidnight });
+
+  return newRemaining;
 }
 
 // POST /session/sync
@@ -301,22 +300,27 @@ async function handleSessionSync(req, res) {
   const email = await redis.get(`token:${sessionToken}`);
   if (!email) return sendJSON(res, 401, { error: "Invalid or expired session" });
 
-  const isSpacedome = email.endsWith("@spacedome.ai");
-  if (isSpacedome) return sendJSON(res, 200, { remainingMs: 99 * 60 * 60 * 1000 });
+  const remainingMs = await chargeElapsed(email, elapsedMs);
+  if (remainingMs === null) return sendJSON(res, 404, { error: "Session not found" });
 
-  const today = new Date().toISOString().slice(0, 10);
-  const dailyKey = `daily:${email}:${today}`;
+  return sendJSON(res, 200, { remainingMs });
+}
 
-  const stored = await redis.get(dailyKey);
-  if (stored === null) return sendJSON(res, 404, { error: "Session not found" });
+// POST /session/logout — charge any unsynced time, then kill the token
+async function handleSessionLogout(req, res) {
+  const body = await parseBody(req);
+  const { sessionToken, elapsedMs } = body;
 
-  const newRemaining = Math.max(0, parseInt(stored, 10) - Math.round(elapsedMs));
-  const secondsUntilMidnight = getSecondsUntilMidnightUTC();
+  if (!sessionToken) return sendJSON(res, 400, { error: "sessionToken required" });
 
-  // Preserve the TTL when updating
-  await redis.set(dailyKey, newRemaining.toString(), { EX: secondsUntilMidnight });
+  const email = await redis.get(`token:${sessionToken}`);
+  if (!email) return sendJSON(res, 200, { success: true });
 
-  return sendJSON(res, 200, { remainingMs: newRemaining });
+  if (typeof elapsedMs === "number" && elapsedMs > 0) await chargeElapsed(email, elapsedMs);
+  await redis.del(`token:${sessionToken}`);
+
+  console.log(`[Session] ${email} logged out`);
+  return sendJSON(res, 200, { success: true });
 }
 
 // GET /session/status
@@ -328,8 +332,7 @@ async function handleSessionStatus(req, res) {
   const email = await redis.get(`token:${sessionToken}`);
   if (!email) return sendJSON(res, 401, { error: "Invalid or expired session" });
 
-  const isSpacedome = email.endsWith("@spacedome.ai");
-  if (isSpacedome) return sendJSON(res, 200, { remainingMs: 99 * 60 * 60 * 1000, email });
+  if (hasUnlimitedAccess(email)) return sendJSON(res, 200, { remainingMs: UNLIMITED_MS, email });
 
   const today = new Date().toISOString().slice(0, 10);
   const dailyKey = `daily:${email}:${today}`;
@@ -364,8 +367,8 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === "POST" && req.url === "/session/send-otp")        return handleSendOtp(req, res);
   if (req.method === "POST" && req.url === "/session/verify-otp")      return handleVerifyOtp(req, res);
-  if (req.method === "POST" && req.url === "/session/start")           return handleSessionStart(req, res);
   if (req.method === "POST" && req.url === "/session/sync")            return handleSessionSync(req, res);
+  if (req.method === "POST" && req.url === "/session/logout")          return handleSessionLogout(req, res);
   if (req.method === "GET"  && req.url?.startsWith("/session/status")) return handleSessionStatus(req, res);
 
   const fs   = require("fs");
