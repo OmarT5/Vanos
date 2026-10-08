@@ -12,7 +12,7 @@ const MAX_REQUESTS_PER_WINDOW = 10;
 const DEMO_DURATION_MS = 10 * 60 * 1000;
 const UNLIMITED_MS = 99 * 60 * 60 * 1000;
 // Emails on these domains (or their subdomains) skip the daily quota
-const UNLIMITED_DOMAINS = ["spacedome.ai", "spacedome.com.pk", "ezagents.ai", "ezytech.global"];
+const UNLIMITED_DOMAINS = ["spacedome.ai", "spacedome.com.pk", "ezagents.ai", "ezytech.global", "ezytechglobal.com"];
 const PUBLIC_URL = process.env.PUBLIC_URL || "https://vanos-production-c921.up.railway.app";
 
 const deepgram = createClient(process.env.DEEPGRAM_API_KEY);
